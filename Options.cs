@@ -11,32 +11,32 @@ namespace SOAPHound
     public class Options
     {
         //Connection Options
-        [Option(HelpText = "Username to use for ADWS Connection. Format: domain\\user or user@domain", Default = null)]
+        [Option('u',"user",HelpText = "Username to use for ADWS Connection. Format: domain\\user or user@domain", Default = null)]
         public string User { get; set; }
 
-        [Option(HelpText = "Password to use for ADWS Connection",  Default = null)]
+        [Option('p',"password",HelpText = "Password to use for ADWS Connection",  Default = null)]
         public string Password { get; set; }
 
-        [Option(HelpText = "Specify domain for enumeration",  Default = null)]
+        [Option('d',"domain",HelpText = "Specify domain for enumeration",  Default = null)]
         public string Domain { get; set; }
 
-        [Option(HelpText = "Domain Controller to connect to",  Default = null)]
+        [Option('x',"dc",HelpText = "Domain Controller to connect to",  Default = null)]
         public string DC { get; set; }
 
         //Supported modes 
-        [Option(HelpText = "Only build cache and not perform further actions", Group = "Mode", Default = false)]
+        [Option('b',"buildcache", HelpText = "Only build cache and not perform further actions", Group = "Mode", Default = false)]
         public bool BuildCache { get; set; }
 
         [Option(HelpText = "Show stats of local cache file", Group = "Mode", Default = null)]
         public bool ShowStats { get; set; }
 
-        [Option(HelpText = "Dump AD Integrated DNS data", Group = "Mode", Default = false)]
+        [Option('n',"dnsdump",HelpText = "Dump AD Integrated DNS data", Group = "Mode", Default = false)]
         public bool DNSDump { get; set; }
 
-        [Option(HelpText = "Dump AD Certificate Services data", Group = "Mode", Default = false)]
+        [Option('s',"certdump",HelpText = "Dump AD Certificate Services data", Group = "Mode", Default = false)]
         public bool CertDump { get; set; }
 
-        [Option(HelpText = "Dump BH data", Group = "Mode", Default = false)]
+        [Option('l',"bhdump",HelpText = "Dump BH data", Group = "Mode", Default = false)]
         public bool BHDump { get; set; }
 
         //Functional Options
@@ -44,7 +44,7 @@ namespace SOAPHound
         public bool AutoSplit { get; set; }
         [Option('t', "threshold", HelpText = "AutoSplit mode: Define split threshold based on number of objects per starting letter", Default = 0)]
         public int Threshold { get; set; }
-        [Option(HelpText = "Do not request LAPS related information", Default = false)]
+        [Option('q',"nolaps",HelpText = "Do not request LAPS related information", Default = false)]
         public bool NoLAPS { get; set; }
         //Output Options
         [Option('o',"outputdirectory",HelpText = "Folder to output files to (full path needed)", Default = null)]
@@ -53,5 +53,9 @@ namespace SOAPHound
         public string CacheFileName { get; set; }
         [Option(HelpText = "Create log file", Default = null )]
         public string LogFile { get; set; }
+        [Option('z', "zip", Required = false, HelpText = "Zip all output files into a single archive.")]
+        public bool Zip { get; set; }
+        [Option('w', "zippass", Required = false, HelpText = "Password for the output zip archive. Requires the --zip option.")]
+        public string ZipPass { get; set; }
     }
 }

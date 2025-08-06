@@ -11,6 +11,9 @@ using SOAPHound.ADWS;
 using SOAPHound.Enums;
 using SOAPHound.Processors;
 using System.Linq;
+using Ionic.Zip;
+using System.Security;
+using System.Text;
 
 namespace SOAPHound
 {
@@ -37,6 +40,8 @@ namespace SOAPHound
         public string domainName = null;
         public string cacheFileName = null;
         public string outputDirectory = null;
+        public Boolean zipOutput = false;
+        public string zipPassword = null;
 
         public static void Main(string[] args)
         {
@@ -58,7 +63,6 @@ namespace SOAPHound
 
         void ParseCommandLineArgs(string[] args)
         {
-
             Trace.WriteLine("Before parsing arguments");
 
             var parser = new Parser(with =>
@@ -73,7 +77,6 @@ namespace SOAPHound
             parserResult
                 .WithParsed<Options>(options => RunOptions(options))
                 .WithNotParsed(errs => DisplayHelp(parserResult, errs));
-
         }
 
         void DisplayHelp<T>(ParserResult<T> result, IEnumerable<Error> errs)
@@ -118,7 +121,6 @@ namespace SOAPHound
             {
                 if (String.IsNullOrEmpty(options.OutputDirectory))
                 {
-
                     DisplayErrorMessage("Output directory is required. Use --outputdirectory");
                     return;
                 }
@@ -177,7 +179,8 @@ namespace SOAPHound
             if (options.DNSDump)
             {
                 dnsdump = true;
-            };
+            }
+            ;
 
             if (options.ShowStats)
             {
@@ -227,7 +230,6 @@ namespace SOAPHound
                         DisplayErrorMessage("AutoSplit threshold is missing, use --threshold.");
                         return;
                     }
-
                 }
                 bhdump = true;
                 cacheFileName = options.CacheFileName;
@@ -235,6 +237,9 @@ namespace SOAPHound
                 threshold = options.Threshold;
                 nolaps = options.NoLAPS;
             }
+
+            zipOutput = options.Zip;
+            zipPassword = options.ZipPass;
 
             domainName = options.Domain;
             domainName = string.IsNullOrEmpty(domainName) ? GetCurrentDomain() : domainName;
@@ -262,24 +267,49 @@ namespace SOAPHound
             {
                 System.IO.Directory.CreateDirectory(Path.GetDirectoryName(cacheFileName));
             }
-            if (dnsdump)
+
+            if (zipOutput)
             {
-                DNSDump();
+                // This block handles all output being written to a single zip file.
+                string zipFileName = Path.Combine(outputDirectory, "output.zip");
+
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(zipFileName));
+                    using (ZipFile zip = new ZipFile())
+                    {
+                        if (!string.IsNullOrEmpty(zipPassword))
+                        {
+                            zip.Password = zipPassword;
+                            zip.Encryption = EncryptionAlgorithm.WinZipAes256;
+                            Console.WriteLine("Applying password to the zip file.");
+                        }
+
+                        if (dnsdump) DNSDumpInMemory(zip);
+                        if (buildcacheonly) GenerateCache();
+                        if (certdump) CertificateDumpInMemory(zip);
+                        if (bhdump || autosplit) ADDumpInMemory(zip);
+
+                        zip.Save(zipFileName);
+                        Console.WriteLine($"Output successfully written to {zipFileName}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    DisplayErrorMessage($"An error occurred while saving the zip file: {ex.Message}");
+                }
             }
-            if (buildcacheonly)
+            else
             {
-                GenerateCache();
-            }
-            if (certdump)
-            {
-                CertificateDump();
-            }
-            if (bhdump || autosplit)
-            {
-                ADDump();
+                // This is the original logic for writing output to individual files.
+                if (dnsdump) DNSDump();
+                if (buildcacheonly) GenerateCache();
+                if (certdump) CertificateDump();
+                if (bhdump || autosplit) ADDump();
             }
         }
 
+        // This is the original DNSDump method writing to files
         private void DNSDump()
         {
             List<ADObject> dnsobjects = ADWSUtils.GetObjects("dns");
@@ -291,6 +321,23 @@ namespace SOAPHound
             }
             Console.WriteLine("-------------");
             Console.WriteLine("Output file generated in " + outputDirectory);
+            dnsdump = false;
+        }
+
+        // New method for dumping DNS records to memory, for zipping
+        private void DNSDumpInMemory(ZipFile zip)
+        {
+            List<ADObject> dnsobjects = ADWSUtils.GetObjects("dns");
+            var output = new StringBuilder(); // A StringBuilder is passed to the method
+            foreach (ADObject dnsobject in dnsobjects)
+            {
+                output.AppendLine(dnsobject.Name);
+                hDNSRecord.ReadandOutputDNSObject(dnsobject.DnsRecord, output);
+            }
+            var stream = new MemoryStream(Encoding.UTF8.GetBytes(output.ToString()));
+            zip.AddEntry("DNS.txt", stream);
+            Console.WriteLine("-------------");
+            Console.WriteLine("DNS output added to zip archive.");
             dnsdump = false;
         }
 
@@ -317,7 +364,7 @@ namespace SOAPHound
                 }
             }
 
-            //Generate cache of PKI objects 
+            //Generate cache of PKI objects
             List<ADObject> cachedpkiobjects = ADWSUtils.GetObjects("pkicache");
 
             foreach (ADObject cachedpkiobject in cachedpkiobjects)
@@ -349,17 +396,89 @@ namespace SOAPHound
                     CATemplate caTemplate = _ca.parseCATemplate(adobject, domainName);
                     outputCATemplate.data.Add(caTemplate);
                 }
-
             }
             outputCA.meta.count = outputCA.data.Count();
             outputCATemplate.meta.count = outputCATemplate.data.Count();
             var jsonString = JsonConvert.SerializeObject(outputCA);
             File.WriteAllText(outputDirectory + "CA.json", jsonString);
-            //Console.WriteLine(jsonString);
             jsonString = JsonConvert.SerializeObject(outputCATemplate);
             File.WriteAllText(outputDirectory + "CATemplate.json", jsonString);
             Console.WriteLine("-------------");
             Console.WriteLine("Output files generated in " + outputDirectory);
+            certdump = false;
+        }
+
+        private void CertificateDumpInMemory(ZipFile zip)
+        {
+            //Loading cache
+            if (!File.Exists(cacheFileName))
+            {
+                Console.WriteLine("File: " + cacheFileName + " does not exist. Generate cache before executing this command.");
+                return;
+            }
+            else
+            {
+                try
+                {
+                    Console.WriteLine("Loading cache from disk");
+                    Cache.Deserialize(cacheFileName);
+                    Console.WriteLine("Loaded cache with stats: " + Cache.GetCacheStats());
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine($"Error loading cache: {e}");
+                    throw;
+                }
+            }
+
+            //Generate cache of PKI objects
+            List<ADObject> cachedpkiobjects = ADWSUtils.GetObjects("pkicache");
+            foreach (ADObject cachedpkiobject in cachedpkiobjects)
+            {
+                if (cachedpkiobject.CertificateTemplates != null)
+                {
+                    string caname = cachedpkiobject.Name.ToUpper();
+                    foreach (string template in cachedpkiobject.CertificateTemplates)
+                    {
+                        PKICache.AddTemplateCA(template, caname);
+                    }
+                }
+            }
+
+            List<ADObject> adobjects = ADWSUtils.GetObjects("pkidata");
+            OutputCA outputCA = new OutputCA();
+            OutputCATemplate outputCATemplate = new OutputCATemplate();
+            CAProcessor _ca = new CAProcessor();
+            foreach (ADObject adobject in adobjects)
+            {
+                if (adobject.Class == "pkienrollmentservice")
+                {
+                    CA caNode = _ca.parseCA(adobject, domainName);
+                    outputCA.data.Add(caNode);
+                }
+
+                if (adobject.Class == "pkicertificatetemplate")
+                {
+                    CATemplate caTemplate = _ca.parseCATemplate(adobject, domainName);
+                    outputCATemplate.data.Add(caTemplate);
+                }
+            }
+            outputCA.meta.count = outputCA.data.Count();
+            outputCATemplate.meta.count = outputCATemplate.data.Count();
+
+            // Helper method for in-memory serialization and zipping
+            void AddToZip(object data, string filename)
+            {
+                var jsonString = JsonConvert.SerializeObject(data);
+                var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(jsonString));
+                zip.AddEntry(filename, stream);
+            }
+
+            AddToZip(outputCA, "CA.json");
+            AddToZip(outputCATemplate, "CATemplate.json");
+
+            Console.WriteLine("-------------");
+            Console.WriteLine("Certificate output added to zip archive.");
             certdump = false;
         }
 
@@ -394,6 +513,41 @@ namespace SOAPHound
                 List<ADObject> adobjects = new List<ADObject>();
                 adobjects = ADWSUtils.GetObjects("ad");
                 CreateOutput(adobjects, "full");
+                adobjects.Clear();
+            }
+        }
+
+        private void ADDumpInMemory(ZipFile zip)
+        {
+            //Loading cache
+            if (!File.Exists(cacheFileName))
+            {
+                Console.WriteLine("File: " + cacheFileName + " does not exist. Generate cache before executing this command.");
+                return;
+            }
+            else
+            {
+                try
+                {
+                    Console.WriteLine("Loading cache from disk");
+                    Cache.Deserialize(cacheFileName);
+                    Console.WriteLine("Loaded cache with stats: " + Cache.GetCacheStats());
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine($"Error loading cache: {e}");
+                    throw;
+                }
+            }
+            if (autosplit)
+            {
+                AutoSplitInMemory(zip);
+            }
+            else
+            {
+                List<ADObject> adobjects = new List<ADObject>();
+                adobjects = ADWSUtils.GetObjects("ad");
+                CreateOutputInMemory(adobjects, "full", zip);
                 adobjects.Clear();
             }
         }
@@ -492,14 +646,11 @@ namespace SOAPHound
             if (sortedDict.ContainsKey("nonchars"))
             {
                 List<ADObject> adobjects = new List<ADObject>();
-                //ParseNonCharsADObjects();
                 adobjects = ADWSUtils.GetObjects("nonchars");
                 CreateOutput(adobjects, "nonchars");
                 adobjects.Clear();
                 sortedDict.Remove("nonchars");
             }
-
-            sortedDict.Remove("nonchars");
 
             // Gathering autosplit data
             foreach (var item in sortedDict)
@@ -519,13 +670,91 @@ namespace SOAPHound
             }
         }
 
+        private void AutoSplitInMemory(ZipFile zip)
+        {
+            char firstChar;
+            string dictKey = null;
+            var dict = new Dictionary<string, int>();
+            foreach (var key in Cache.ValueToIdCache.Keys)
+            {
+                if (key.StartsWith("CN="))
+                {
+                    firstChar = key.ToString().ToLower()[3];
+                    if (!"abcdefghijklmnopqrstuvwxyz0123456789".Contains(firstChar))
+                    {
+                        dictKey = "nonchars";
+                    }
+                    else
+                    {
+                        dictKey = firstChar.ToString();
+                    }
+                }
+                if (dictKey != null)
+                {
+                    if (dict.ContainsKey(dictKey))
+                    {
+                        dict[dictKey]++;
+                    }
+                    else
+                    {
+                        dict[dictKey] = 1;
+                    }
+                }
+
+            }
+
+            var sortedDict = new SortedDictionary<string, int>(dict);
+            if (showStats)
+            {
+                foreach (var kvp in sortedDict)
+                {
+                    Console.WriteLine("Key = {0}, Value = {1}", kvp.Key, kvp.Value);
+                }
+                Console.WriteLine("Finished");
+                return;
+            }
+
+            //Gathering Domains data
+            List<ADObject> domobjects = new List<ADObject>();
+            domobjects = ADWSUtils.GetObjects("domains");
+            CreateOutputInMemory(domobjects, "dom", zip);
+            domobjects.Clear();
+
+            // Gathering non alphanumeric data
+            if (sortedDict.ContainsKey("nonchars"))
+            {
+                List<ADObject> adobjects = new List<ADObject>();
+                adobjects = ADWSUtils.GetObjects("nonchars");
+                CreateOutputInMemory(adobjects, "nonchars", zip);
+                adobjects.Clear();
+                sortedDict.Remove("nonchars");
+            }
+
+            // Gathering autosplit data
+            foreach (var item in sortedDict)
+            {
+                if (item.Value < threshold)
+                {
+                    Console.WriteLine("Gathering full letter: " + item.Key);
+                    deep = false;
+                    ParseAutosplitObjectsInMemory(item.Key, c2, zip);
+                }
+                else
+                {
+                    Console.WriteLine("Gathering split letter: " + item.Key);
+                    deep = true;
+                    ParseAutosplitObjectsInMemory(item.Key, c2, zip);
+                }
+            }
+        }
+
         private void ParseAutosplitObjects(string str1, string str2)
         {
             foreach (char c1 in str1)
             {
                 if (deep)
                 {
-                    //Gather 2nd depth level 
+                    //Gather 2nd depth level
                     foreach (char c2 in str2)
                     {
                         List<ADObject> objects = ADWSUtils.GetObjects("(cn=" + c1 + c2 + "*)");
@@ -547,9 +776,37 @@ namespace SOAPHound
             }
         }
 
+        private void ParseAutosplitObjectsInMemory(string str1, string str2, ZipFile zip)
+        {
+            foreach (char c1 in str1)
+            {
+                if (deep)
+                {
+                    //Gather 2nd depth level
+                    foreach (char c2 in str2)
+                    {
+                        List<ADObject> objects = ADWSUtils.GetObjects("(cn=" + c1 + c2 + "*)");
+                        CreateOutputInMemory(objects, c1.ToString() + c2.ToString(), zip);
+                        objects.Clear();
+                    }
+                    //Gather non alphanumeric in 2nd depth level
+                    List<ADObject> adobjects = ADWSUtils.GetObjects("(&(cn=" + c1 + "*)(!(cn=" + c1 + "a*))(!(cn=" + c1 + "b*))(!(cn=" + c1 + "c*))(!(cn=" + c1 + "d*))(!(cn=" + c1 + "e*))(!(cn=" + c1 + "f*))(!(cn=" + c1 + "g*))(!(cn=" + c1 + "h*))(!(cn=" + c1 + "i*))(!(cn=" + c1 + "j*))(!(cn=" + c1 + "k*))(!(cn=" + c1 + "l*))(!(cn=" + c1 + "m*))(!(cn=" + c1 + "n*))(!(cn=" + c1 + "o*))(!(cn=" + c1 + "p*))(!(cn=" + c1 + "q*))(!(cn=" + c1 + "r*))(!(cn=" + c1 + "s*))(!(cn=" + c1 + "t*))(!(cn=" + c1 + "u*))(!(cn=" + c1 + "v*))(!(cn=" + c1 + "w*))(!(cn=" + c1 + "x*))(!(cn=" + c1 + "y*))(!(cn=" + c1 + "z*))(!(cn=" + c1 + "0*))(!(cn=" + c1 + "1*))(!(cn=" + c1 + "2*))(!(cn=" + c1 + "3*))(!(cn=" + c1 + "4*))(!(cn=" + c1 + "5*))(!(cn=" + c1 + "6*))(!(cn=" + c1 + "7*))(!(cn=" + c1 + "8*))(!(cn=" + c1 + "9*)))");
+                    CreateOutputInMemory(adobjects, c1.ToString() + "_nonchars_", zip);
+                    adobjects.Clear();
+                }
+                else
+                {
+                    //Gather full letter
+                    List<ADObject> adobjects = ADWSUtils.GetObjects("(cn=" + c1 + "*)");
+                    CreateOutputInMemory(adobjects, c1.ToString(), zip);
+                    adobjects.Clear();
+                }
+            }
+        }
+
+
         public void CreateOutput(List<ADObject> adobjects, string header)
         {
-
             OutputComputers outputComputers = new OutputComputers();
             OutputUsers outputUsers = new OutputUsers();
             OutputGroups outputGroups = new OutputGroups();
@@ -559,7 +816,7 @@ namespace SOAPHound
             OutputContainers outputContainers = new OutputContainers();
 
             foreach (ADObject adobject in adobjects)
-            {    
+            {
                 try
                 {
                     if (adobject.Class == "computer")
@@ -579,7 +836,7 @@ namespace SOAPHound
                         GroupProcessor _grp = new GroupProcessor();
                         GroupNode groupNode = _grp.parseGroupObject(adobject, domainName);
                         outputGroups.data.Add(groupNode);
-    
+
                     }
                     else if (adobject.Class == "domaindns" || adobject.Class == "domain")
                     {
@@ -607,28 +864,22 @@ namespace SOAPHound
                             continue;
                         if (dn.Contains("CN=POLICIES,CN=SYSTEM") && (dn.StartsWith("CN=USER") || dn.StartsWith("CN=MACHINE")))
                             continue;
-    
+
                         ContainerProcessor _cp = new ContainerProcessor();
                         ContainerNode containerNode = _cp.parseContainerObject(adobject, domainName);
                         outputContainers.data.Add(containerNode);
-                    }
-                    else
-                    {
-    
-                        //Trace.WriteLine("we have an unprocessed " + adobject.Class + " object:" + adobject.Name);
                     }
                 }
                 catch (Exception e)
                 {
                     DisplayErrorMessage("Exception " + e.ToString() + "\nError parsing object with ObjectGUID :" + adobject.ObjectGUID.ToString());
-                }                
+                }
             }
             outputUsers.meta.count = outputUsers.data.Count();
             if (outputUsers.meta.count > 0)
             {
                 var jsonString = JsonConvert.SerializeObject(outputUsers);
                 File.WriteAllText(outputDirectory + header + "_outputUsers.json", jsonString);
-                //Console.WriteLine(jsonString);
             }
 
             outputComputers.meta.count = outputComputers.data.Count();
@@ -636,7 +887,6 @@ namespace SOAPHound
             {
                 var jsonString = JsonConvert.SerializeObject(outputComputers);
                 File.WriteAllText(outputDirectory + header + "_outputComputers.json", jsonString);
-                //Console.WriteLine(jsonString);
             }
 
             outputGroups.meta.count = outputGroups.data.Count();
@@ -644,7 +894,6 @@ namespace SOAPHound
             {
                 var jsonString = JsonConvert.SerializeObject(outputGroups);
                 File.WriteAllText(outputDirectory + header + "_outputGroups.json", jsonString);
-                //Console.WriteLine(jsonString);
             }
 
             outputDomains.meta.count = outputDomains.data.Count();
@@ -652,7 +901,6 @@ namespace SOAPHound
             {
                 var jsonString = JsonConvert.SerializeObject(outputDomains);
                 File.WriteAllText(outputDirectory + header + "_outputDomains.json", jsonString);
-                //Console.WriteLine(jsonString);
             }
 
             outputGPOs.meta.count = outputGPOs.data.Count();
@@ -660,7 +908,6 @@ namespace SOAPHound
             {
                 var jsonString = JsonConvert.SerializeObject(outputGPOs);
                 File.WriteAllText(outputDirectory + header + "_outputGPOs.json", jsonString);
-                //Console.WriteLine(jsonString);
             }
 
             outputOUs.meta.count = outputOUs.data.Count();
@@ -668,7 +915,6 @@ namespace SOAPHound
             {
                 var jsonString = JsonConvert.SerializeObject(outputOUs);
                 File.WriteAllText(outputDirectory + header + "_outputOUs.json", jsonString);
-                //Console.WriteLine(jsonString);
             }
 
             outputContainers.meta.count = outputContainers.data.Count();
@@ -676,15 +922,111 @@ namespace SOAPHound
             {
                 var jsonString = JsonConvert.SerializeObject(outputContainers);
                 File.WriteAllText(outputDirectory + header + "_outputContainers.json", jsonString);
-                //Console.WriteLine(jsonString);
             }
             Console.WriteLine("-------------");
             Console.WriteLine("Output files with prefix \"" + header + "\" generated in " + outputDirectory);
             Console.WriteLine("-------------");
-
         }
 
+        public void CreateOutputInMemory(List<ADObject> adobjects, string header, ZipFile zip)
+        {
+            OutputComputers outputComputers = new OutputComputers();
+            OutputUsers outputUsers = new OutputUsers();
+            OutputGroups outputGroups = new OutputGroups();
+            OutputDomains outputDomains = new OutputDomains();
+            OutputGPOs outputGPOs = new OutputGPOs();
+            OutputOUs outputOUs = new OutputOUs();
+            OutputContainers outputContainers = new OutputContainers();
+
+            foreach (ADObject adobject in adobjects)
+            {
+                try
+                {
+                    if (adobject.Class == "computer")
+                    {
+                        ComputerProcessor _comp = new ComputerProcessor();
+                        ComputerNode computerNode = _comp.parseComputerObject(adobject, domainName);
+                        outputComputers.data.Add(computerNode);
+                    }
+                    else if (adobject.Class == "user")
+                    {
+                        UserProcessor _usr = new UserProcessor();
+                        UserNode userNode = _usr.parseUserObject(adobject, domainName);
+                        outputUsers.data.Add(userNode);
+                    }
+                    else if (adobject.Class == "group")
+                    {
+                        GroupProcessor _grp = new GroupProcessor();
+                        GroupNode groupNode = _grp.parseGroupObject(adobject, domainName);
+                        outputGroups.data.Add(groupNode);
+                    }
+                    else if (adobject.Class == "domaindns" || adobject.Class == "domain")
+                    {
+                        DomainProcessor _dom = new DomainProcessor(Server, Port, Credential);
+                        DomainNode domainNode = _dom.parseDomainObject(adobject);
+                        outputDomains.data.Add(domainNode);
+                    }
+                    else if (adobject.Class == "grouppolicycontainer")
+                    {
+                        GPOProcessor _gpo = new GPOProcessor();
+                        GPONode gpoNode = _gpo.parseGPOObject(adobject, domainName);
+                        outputGPOs.data.Add(gpoNode);
+                    }
+                    else if (adobject.Class == "organizationalunit")
+                    {
+                        OUProcessor _ou = new OUProcessor();
+                        OUNode ouNode = _ou.parseOUObject(adobject, domainName);
+                        outputOUs.data.Add(ouNode);
+                    }
+                    else if (adobject.Class == "container" || adobject.Class == "rpccontainer" || adobject.Class == "msimaging-psps" || adobject.Class == "msExchConfigurationContainer")
+                    {
+                        string dn = adobject.DistinguishedName.ToUpper();
+                        if (dn.Contains("CN=DOMAINUPDATES,CN=SYSTEM"))
+                            continue;
+                        if (dn.Contains("CN=POLICIES,CN=SYSTEM") && (dn.StartsWith("CN=USER") || dn.StartsWith("CN=MACHINE")))
+                            continue;
+                        ContainerProcessor _cp = new ContainerProcessor();
+                        ContainerNode containerNode = _cp.parseContainerObject(adobject, domainName);
+                        outputContainers.data.Add(containerNode);
+                    }
+                }
+                catch (Exception e)
+                {
+                    DisplayErrorMessage("Exception " + e.ToString() + "\nError parsing object with ObjectGUID :" + adobject.ObjectGUID.ToString());
+                }
+            }
+
+            void AddToZip(object data, string filename)
+            {
+                var jsonString = JsonConvert.SerializeObject(data);
+                var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(jsonString));
+                zip.AddEntry(filename, stream);
+            }
+
+            outputUsers.meta.count = outputUsers.data.Count();
+            if (outputUsers.meta.count > 0) AddToZip(outputUsers, header + "_outputUsers.json");
+
+            outputComputers.meta.count = outputComputers.data.Count();
+            if (outputComputers.meta.count > 0) AddToZip(outputComputers, header + "_outputComputers.json");
+
+            outputGroups.meta.count = outputGroups.data.Count();
+            if (outputGroups.meta.count > 0) AddToZip(outputGroups, header + "_outputGroups.json");
+
+            outputDomains.meta.count = outputDomains.data.Count();
+            if (outputDomains.meta.count > 0) AddToZip(outputDomains, header + "_outputDomains.json");
+
+            outputGPOs.meta.count = outputGPOs.data.Count();
+            if (outputGPOs.meta.count > 0) AddToZip(outputGPOs, header + "_outputGPOs.json");
+
+            outputOUs.meta.count = outputOUs.data.Count();
+            if (outputOUs.meta.count > 0) AddToZip(outputOUs, header + "_outputOUs.json");
+
+            outputContainers.meta.count = outputContainers.data.Count();
+            if (outputContainers.meta.count > 0) AddToZip(outputContainers, header + "_outputContainers.json");
+
+            Console.WriteLine("-------------");
+            Console.WriteLine($"Output files with prefix \"{header}\" added to zip archive.");
+            Console.WriteLine("-------------");
+        }
     }
-
 }
-
